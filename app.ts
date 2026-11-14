@@ -10,7 +10,6 @@
 // JSON, never HTML, and a request with no bearer token is 401 where the contract requires auth.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { randomUUID } from 'node:crypto';
 import { Store } from './store.ts';
 import { handleRest, repoJson } from './rest.ts';
 import { handleGraphQL } from './graphql.ts';
@@ -21,12 +20,24 @@ const JSON_TYPE = 'application/json; charset=utf-8';
 
 export const store = new Store();
 
+// Request ids only have to be non-empty and distinct within a run; a counter costs far less than a
+// UUID and keeps every reply's id in order.
+let requestSeq = 0;
+function nextRequestId(): string {
+  requestSeq += 1;
+  return `forge-${process.pid.toString(16)}-${requestSeq.toString(36)}`;
+}
+
 function send(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
+  sendText(res, status, `${JSON.stringify(body)}\n`, headers);
+}
+
+/** Send JSON that was serialized before the request (a cached, unchanged body). */
+function sendText(res: ServerResponse, status: number, text: string, headers: Record<string, string> = {}): void {
   res.writeHead(status, {
     'content-type': JSON_TYPE,
     'content-length': Buffer.byteLength(text),
-    'x-github-request-id': randomUUID(),
+    'x-github-request-id': nextRequestId(),
     ...headers,
   });
   res.end(text);
@@ -37,7 +48,7 @@ function sendRaw(res: ServerResponse, status: number, body: Buffer, contentType:
     'content-type': contentType,
     'content-length': body.length,
     'cache-control': 'no-cache',
-    'x-github-request-id': randomUUID(),
+    'x-github-request-id': nextRequestId(),
     ...headers,
   });
   res.end(body);
@@ -112,7 +123,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const raw = await readBody(req);
     const reply = handleMcp(store, raw.toString('utf8'));
     if (reply.empty === true) {
-      res.writeHead(reply.status, { 'content-length': 0, 'x-github-request-id': randomUUID() });
+      res.writeHead(reply.status, { 'content-length': 0, 'x-github-request-id': nextRequestId() });
       res.end();
       return;
     }
@@ -179,8 +190,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     if (reply.status === 204) {
-      res.writeHead(204, { 'x-github-request-id': randomUUID() });
+      res.writeHead(204, { 'x-github-request-id': nextRequestId() });
       res.end();
+      return;
+    }
+    if (reply.text !== undefined) {
+      sendText(res, reply.status, reply.text, reply.headers ?? {});
       return;
     }
     send(res, reply.status, reply.body, reply.headers ?? {});

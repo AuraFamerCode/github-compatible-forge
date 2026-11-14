@@ -99,6 +99,8 @@ export interface Repo {
   nextLabelId: number;
   /** Flattened tree cache: `${commit}\u0000${tree}` -> paths. */
   readonly flatCache: Map<string, Map<string, FileEntry>>;
+  /** Serialized packs, keyed by wants/depth/shallow: repeated clones of one tip share the bytes. */
+  readonly packCache: Map<string, { pack: Buffer; boundary: string[]; count: number }>;
 }
 
 // --------------------------------------------------------------------------- clock
@@ -110,7 +112,8 @@ let lastIso = '';
 export function nowIso(): string {
   const ms = Math.max(Date.now(), lastMs + 1);
   lastMs = ms;
-  lastIso = new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const iso = new Date(ms).toISOString();
+  lastIso = `${iso.slice(0, 19)}Z`;
   return lastIso;
 }
 export function lastTimestamp(): string {
@@ -161,6 +164,7 @@ export class Store {
       nextCommentId: 1,
       nextLabelId: 1,
       flatCache: new Map(),
+      packCache: new Map(),
     };
     this.repos.set(this.key(owner, name), repo);
     return repo;
@@ -182,7 +186,10 @@ export class Store {
 
 export function putObject(repo: Repo, type: ObjType, data: Buffer): string {
   const sha = hashObject(type, data);
-  if (!repo.objects.has(sha)) repo.objects.set(sha, { type, data });
+  if (!repo.objects.has(sha)) {
+    repo.objects.set(sha, { type, data });
+    repo.packCache.clear();
+  }
   return sha;
 }
 

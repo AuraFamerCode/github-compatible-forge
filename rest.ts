@@ -29,6 +29,8 @@ export interface Reply {
   headers?: Record<string, string>;
   raw?: Buffer;
   contentType?: string;
+  /** An already serialized JSON body: used when the bytes are cached instead of rebuilt. */
+  text?: string;
 }
 
 type Query = Record<string, string | undefined>;
@@ -38,6 +40,11 @@ const JSON_TYPE = 'application/json; charset=utf-8';
 
 export function jsonReply(status: number, body: unknown, headers: Record<string, string> = {}): Reply {
   return { status, body, headers };
+}
+
+/** A reply whose JSON bytes were serialized earlier and are unchanged since. */
+export function jsonTextReply(status: number, text: string, headers: Record<string, string> = {}): Reply {
+  return { status, text, headers };
 }
 
 export function errorReply(status: number, message: string, extra: Record<string, unknown> = {}): Reply {
@@ -153,6 +160,21 @@ export function issueJson(repo: Repo, issue: Issue, host: string): Record<string
     author_association: 'OWNER',
     repository: { id: repo.id, name: repo.name, full_name: full },
   };
+}
+
+// One issue's serialized JSON, kept until something it shows changes: a read of an unchanged issue
+// costs a map lookup instead of re-walking labels and every URL in the object.
+const issueTexts = new Map<string, { fingerprint: string; text: string }>();
+
+function issueText(repo: Repo, issue: Issue, host: string): string {
+  const key = `${repo.id}:${issue.id}:${host}`;
+  const fingerprint = `${issue.updated_at}|${issue.state}|${issue.closed_at ?? ''}|${issue.title.length}|${issue.body.length}|${issue.comments.length}|${issue.labels.join(',')}`;
+  const hit = issueTexts.get(key);
+  if (hit !== undefined && hit.fingerprint === fingerprint) return hit.text;
+  const text = `${JSON.stringify(issueJson(repo, issue, host))}\n`;
+  if (issueTexts.size > 4096) issueTexts.clear();
+  issueTexts.set(key, { fingerprint, text });
+  return text;
 }
 
 function userRef(login: string): Record<string, unknown> {
@@ -645,8 +667,9 @@ export function handleRest(store: Store, request: RestRequest): Reply | null {
           return direction === 'asc' ? cmp : -cmp;
         });
         const paging = pageOf(query);
-        const paged = paginate(items.map((issue) => issueJson(repo, issue, host)), paging, `/repos/${repo.owner}/${repo.name}/issues`, host, `&state=${encodeURIComponent(state)}`);
-        return jsonReply(200, paged.items, paged.headers);
+        const paged = paginate(items, paging, `/repos/${repo.owner}/${repo.name}/issues`, host, `&state=${encodeURIComponent(state)}`);
+        const text = `[${paged.items.map((issue) => issueText(repo, issue, host).trimEnd()).join(',')}]\n`;
+        return jsonTextReply(200, text, paged.headers);
       }
       return errorReply(405, 'Method Not Allowed');
     }
@@ -657,7 +680,7 @@ export function handleRest(store: Store, request: RestRequest): Reply | null {
     if (issue === undefined) return errorReply(404, 'Not Found');
 
     if (rest.length === 2) {
-      if (method === 'GET') return jsonReply(200, issueJson(repo, issue, host));
+      if (method === 'GET') return jsonTextReply(200, issueText(repo, issue, host));
       if (method === 'PATCH') {
         if (typeof body.title === 'string') issue.title = body.title;
         if (typeof body.body === 'string') issue.body = body.body;

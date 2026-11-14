@@ -270,6 +270,21 @@ function packFor(repo: Repo, wants: readonly string[], exclude: Set<string>, dep
   return { pack: objects.length === 0 ? Buffer.alloc(0) : writePack(objects), boundary, count: objects.length };
 }
 
+/** The same pack as packFor, memoized when nothing is excluded (a fresh clone of one tip). */
+function packForCached(repo: Repo, wants: readonly string[], exclude: Set<string>, depth: number | null, existingShallow: readonly string[]): { pack: Buffer; boundary: string[]; count: number } {
+  if (exclude.size > 0) return packFor(repo, wants, exclude, depth, existingShallow);
+  const key = `${depth === null ? 'all' : depth}|${wants.join(',')}|${existingShallow.join(',')}`;
+  const hit = repo.packCache.get(key);
+  if (hit !== undefined) return hit;
+  const built = packFor(repo, wants, exclude, depth, existingShallow);
+  // The cache is dropped whenever an object is stored, so it can only hold packs for stored objects.
+  if (built.pack.length <= 4 * 1024 * 1024) {
+    if (repo.packCache.size > 32) repo.packCache.clear();
+    repo.packCache.set(key, built);
+  }
+  return built;
+}
+
 // --------------------------------------------------------------------------- v2 ls-refs
 
 function lsRefs(repo: Repo, request: Packet[]): Buffer {
@@ -359,7 +374,7 @@ function v2Fetch(repo: Repo, request: Packet[]): Buffer {
     for (const boundary of shallow) exclude.add(boundary);
   }
 
-  const { pack, boundary, count } = packFor(repo, wants, exclude, depth, shallow);
+  const { pack, boundary, count } = packForCached(repo, wants, exclude, depth, shallow);
 
   if (haves.length > 0) {
     const acks: Buffer[] = [];
@@ -421,7 +436,7 @@ function v0Fetch(repo: Repo, packets: Packet[]): Buffer {
       if (repo.objects.has(have)) reachableObjects(repo, have, exclude);
     }
   }
-  const { pack, boundary, count } = packFor(repo, wants, exclude, depth, shallow);
+  const { pack, boundary, count } = packForCached(repo, wants, exclude, depth, shallow);
   const parts: Buffer[] = [];
   if (depth !== null) {
     for (const sha of boundary) parts.push(pktLine(`shallow ${sha}\n`));
@@ -481,11 +496,15 @@ function receivePack(repo: Repo, body: Buffer): Buffer {
   let unpackOk = true;
   let unpackDetail = 'ok';
   const packBytes = body.subarray(packStart);
+  let storedObject = false;
   if (packBytes.length >= 32 && packBytes.toString('latin1', 0, 4) === 'PACK') {
     try {
       const read = readPack(packBytes, (oid) => repo.objects.get(oid));
       for (const [sha, object] of read.objects) {
-        if (!repo.objects.has(sha)) repo.objects.set(sha, object);
+        if (!repo.objects.has(sha)) {
+          repo.objects.set(sha, object);
+          storedObject = true;
+        }
       }
     } catch (error) {
       unpackOk = false;
@@ -494,6 +513,7 @@ function receivePack(repo: Repo, body: Buffer): Buffer {
   }
 
   const report: string[] = [`unpack ${unpackOk ? 'ok' : `error ${unpackDetail}`}`];
+  if (storedObject) repo.packCache.clear();
   for (const command of commands) {
     if (command.new === ZERO_SHA) {
       const existing = repo.refs.get(command.ref);
@@ -511,7 +531,16 @@ function receivePack(repo: Repo, body: Buffer): Buffer {
     }
     const current = repo.refs.get(command.ref) ?? null;
     if (current !== null && command.old !== ZERO_SHA) {
-      const fastForward = isAncestor(repo, command.old, command.new) || current === command.new;
+      // A push on top of the tip its commit names as a parent is the common case; testing that one
+      // edge is enough to accept it without walking the history behind it.
+      let fastForward = current === command.new;
+      if (!fastForward && current === command.old) {
+        const object = repo.objects.get(command.new);
+        if (object !== undefined && object.type === 'commit') {
+          fastForward = parseCommit(object.data).parents.includes(command.old);
+        }
+      }
+      if (!fastForward) fastForward = isAncestor(repo, command.old, command.new);
       if (!fastForward) {
         report.push(`ng ${command.ref} non-fast-forward`);
         continue;
