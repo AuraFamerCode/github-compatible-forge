@@ -98,17 +98,20 @@ function text(packet: Packet): string {
 
 // --------------------------------------------------------------------------- advertisement
 
+// The v2 capability list never depends on the request or the repository, so it is framed once.
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine('agent=forge/1.0\n'),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow wait-for-done\n'),
+  pktLine('server-option\n'),
+  pktLine('object-format=sha1\n'),
+  pktLine('object-info\n'),
+  FLUSH,
+]);
+
 function v2Advertisement(): Buffer {
-  const lines = [
-    pktLine('version 2\n'),
-    pktLine('agent=forge/1.0\n'),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow wait-for-done\n'),
-    pktLine('server-option\n'),
-    pktLine('object-format=sha1\n'),
-    pktLine('object-info\n'),
-  ];
-  return Buffer.concat([...lines, FLUSH]);
+  return V2_ADVERTISEMENT;
 }
 
 function refAdvertLines(repo: Repo, service: string): Buffer {
@@ -286,6 +289,20 @@ function packForCached(repo: Repo, wants: readonly string[], exclude: Set<string
 }
 
 // --------------------------------------------------------------------------- v2 ls-refs
+
+// A ref listing depends only on the refs and the request, so a client that asks the same question
+// twice (a clone does) is answered from the previous bytes until a ref moves.
+const lsRefsCache = new Map<string, Buffer>();
+
+function lsRefsCached(repo: Repo, request: Packet[]): Buffer {
+  const key = `${repo.id}\u0000${repo.refsVersion}\u0000${request.map((packet) => (packet.kind === 'data' ? text(packet) : packet.kind)).join('')}`;
+  const hit = lsRefsCache.get(key);
+  if (hit !== undefined) return hit;
+  const built = lsRefs(repo, request);
+  if (lsRefsCache.size > 256) lsRefsCache.clear();
+  lsRefsCache.set(key, built);
+  return built;
+}
 
 function lsRefs(repo: Repo, request: Packet[]): Buffer {
   const prefixes: string[] = [];
@@ -608,7 +625,7 @@ export function handleSmart(
     const command = packets.length > 0 && packets[0].kind === 'data' ? text(packets[0]).trim() : '';
     const args = packets.slice(1);
     let response: Buffer;
-    if (command === 'command=ls-refs') response = lsRefs(repo, args);
+    if (command === 'command=ls-refs') response = lsRefsCached(repo, args);
     else if (command === 'command=fetch') response = v2Fetch(repo, args);
     else response = v0Fetch(repo, packets);
     return { status: 200, body: response, contentType: `application/x-${UPLOAD_PACK}-result` };

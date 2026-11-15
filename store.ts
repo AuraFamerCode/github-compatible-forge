@@ -101,6 +101,8 @@ export interface Repo {
   readonly flatCache: Map<string, Map<string, FileEntry>>;
   /** Serialized packs, keyed by wants/depth/shallow: repeated clones of one tip share the bytes. */
   readonly packCache: Map<string, { pack: Buffer; boundary: string[]; count: number }>;
+  /** Bumped on every ref write, so a cached ref listing knows when it is stale. */
+  refsVersion: number;
 }
 
 // --------------------------------------------------------------------------- clock
@@ -165,6 +167,7 @@ export class Store {
       nextLabelId: 1,
       flatCache: new Map(),
       packCache: new Map(),
+      refsVersion: 0,
     };
     this.repos.set(this.key(owner, name), repo);
     return repo;
@@ -316,12 +319,15 @@ export function makeCommit(
 
 export function setRef(repo: Repo, ref: string, sha: string): void {
   repo.refs.set(refName(ref), sha);
+  repo.refsVersion += 1;
   repo.pushed_at = nowIso();
   repo.updated_at = repo.pushed_at;
 }
 
 export function deleteRef(repo: Repo, ref: string): boolean {
-  return repo.refs.delete(refName(ref));
+  const removed = repo.refs.delete(refName(ref));
+  if (removed) repo.refsVersion += 1;
+  return removed;
 }
 
 export function branches(repo: Repo): Array<{ name: string; sha: string }> {

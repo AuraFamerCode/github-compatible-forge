@@ -9,7 +9,8 @@
 // Everything else answers GitHub's JSON 404. Every API reply carries an X-GitHub-Request-Id and is
 // JSON, never HTML, and a request with no bearer token is 401 where the contract requires auth.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import type { Server } from 'node:net';
+import { createServer, type Request, type Response } from './server.ts';
 import { Store } from './store.ts';
 import { handleRest, repoJson } from './rest.ts';
 import { handleGraphQL } from './graphql.ts';
@@ -28,12 +29,12 @@ function nextRequestId(): string {
   return `forge-${process.pid.toString(16)}-${requestSeq.toString(36)}`;
 }
 
-function send(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
+function send(res: Response, status: number, body: unknown, headers: Record<string, string> = {}): void {
   sendText(res, status, `${JSON.stringify(body)}\n`, headers);
 }
 
 /** Send JSON that was serialized before the request (a cached, unchanged body). */
-function sendText(res: ServerResponse, status: number, text: string, headers: Record<string, string> = {}): void {
+function sendText(res: Response, status: number, text: string, headers: Record<string, string> = {}): void {
   res.writeHead(status, {
     'content-type': JSON_TYPE,
     'content-length': Buffer.byteLength(text),
@@ -43,7 +44,7 @@ function sendText(res: ServerResponse, status: number, text: string, headers: Re
   res.end(text);
 }
 
-function sendRaw(res: ServerResponse, status: number, body: Buffer, contentType: string, headers: Record<string, string> = {}): void {
+function sendRaw(res: Response, status: number, body: Buffer, contentType: string, headers: Record<string, string> = {}): void {
   res.writeHead(status, {
     'content-type': contentType,
     'content-length': body.length,
@@ -54,17 +55,8 @@ function sendRaw(res: ServerResponse, status: number, body: Buffer, contentType:
   res.end(body);
 }
 
-function readBody(req: IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', (error) => reject(error));
-  });
-}
-
-function bearer(req: IncomingMessage): string {
-  const header = req.headers.authorization;
+function bearer(headers: Record<string, string>): string {
+  const header = headers.authorization;
   if (typeof header !== 'string') return '';
   const match = /^Bearer\s+(.+)$/i.exec(header.trim());
   return match === null ? '' : match[1].trim();
@@ -81,9 +73,10 @@ function parseJson(raw: Buffer): { ok: true; value: unknown } | { ok: false } {
   }
 }
 
-function queryOf(url: URL): Record<string, string | undefined> {
+function queryOf(search: string): Record<string, string | undefined> {
   const out: Record<string, string | undefined> = {};
-  for (const [key, value] of url.searchParams) if (!(key in out)) out[key] = value;
+  if (search === '') return out;
+  for (const [key, value] of new URLSearchParams(search)) if (!(key in out)) out[key] = value;
   return out;
 }
 
@@ -91,16 +84,9 @@ function asObject(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
 
-async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const method = req.method ?? 'GET';
-  let url: URL;
-  try {
-    url = new URL(req.url ?? '/', 'http://forge');
-  } catch {
-    send(res, 400, { message: 'Bad Request' });
-    return;
-  }
-  const path = url.pathname;
+function handle(req: Request, res: Response): void {
+  const method = req.method;
+  const path = req.path;
   const segments = path.split('/').filter((part) => part !== '').map((part) => decodeURIComponent(part));
 
   if (method === 'GET' && path === '/healthz') {
@@ -108,7 +94,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
-  const token = bearer(req);
+  const token = bearer(req.headers);
 
   // ------------------------------------------------------------------ MCP
   if (segments.length === 1 && segments[0] === 'mcp') {
@@ -120,8 +106,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       send(res, 405, { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'the MCP endpoint takes POST' } });
       return;
     }
-    const raw = await readBody(req);
-    const reply = handleMcp(store, raw.toString('utf8'));
+    const reply = handleMcp(store, req.body.toString('utf8'));
     if (reply.empty === true) {
       res.writeHead(reply.status, { 'content-length': 0, 'x-github-request-id': nextRequestId() });
       res.end();
@@ -141,8 +126,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       send(res, 405, { message: 'Method Not Allowed' });
       return;
     }
-    const raw = await readBody(req);
-    const parsed = parseJson(raw);
+    const parsed = parseJson(req.body);
     if (!parsed.ok) {
       send(res, 400, { message: 'Problems parsing JSON' });
       return;
@@ -168,7 +152,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       }, { 'x-oauth-scopes': 'repo, read:org' });
       return;
     }
-    const raw = method === 'GET' || method === 'DELETE' ? Buffer.alloc(0) : await readBody(req);
+    const raw = req.body;
     let body: Record<string, unknown> = {};
     if (raw.length > 0) {
       const parsed = parseJson(raw);
@@ -181,7 +165,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const reply = handleRest(store, {
       method,
       segments: rest,
-      query: queryOf(url),
+      query: queryOf(req.search),
       body,
       host: req.headers.host ?? 'forge',
     });
@@ -209,9 +193,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendRaw(res, 401, Buffer.from('{"message":"Requires authentication"}\n', 'utf8'), JSON_TYPE);
       return;
     }
-    const raw = method === 'POST' ? await readBody(req) : Buffer.alloc(0);
+    const raw = req.body;
     const protocol = String(req.headers['git-protocol'] ?? '');
-    const reply = handleSmart(store, target, method, url.searchParams, protocol, raw);
+    const reply = handleSmart(store, target, method, new URLSearchParams(req.search), protocol, raw);
     sendRaw(res, reply.status, reply.body, reply.contentType);
     return;
   }
@@ -221,19 +205,18 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on port 0. */
 export function createApp(): Server {
-  const server = createServer((req, res) => {
-    handle(req, res).catch((error: unknown) => {
+  return createServer((req, res) => {
+    try {
+      handle(req, res);
+    } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       try {
         send(res, 500, { message: `Internal error: ${message}` });
       } catch {
         res.destroy();
       }
-    });
+    }
   });
-  server.keepAliveTimeout = 65_000;
-  server.headersTimeout = 66_000;
-  return server;
 }
 
 export { repoJson };
