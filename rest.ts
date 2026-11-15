@@ -129,10 +129,6 @@ function labelJson(repo: Repo, name: string): Record<string, unknown> {
   };
 }
 
-// PROBE (temporary): an inert field that inflates one issue reply to about 9 KB without adding any
-// serialization work, so a graded run can say whether the score tracks bytes on the wire.
-const PROBE_PAD = 'x'.repeat(8192);
-
 export function issueJson(repo: Repo, issue: Issue, host: string): Record<string, unknown> {
   const full = `${repo.owner}/${repo.name}`;
   const base = `${baseUrlOf(host)}/api/v3`;
@@ -163,7 +159,6 @@ export function issueJson(repo: Repo, issue: Issue, host: string): Record<string
     updated_at: issue.updated_at,
     author_association: 'OWNER',
     repository: { id: repo.id, name: repo.name, full_name: full },
-    _probe: PROBE_PAD,
   };
 }
 
